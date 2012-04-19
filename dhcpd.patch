@@ -1,0 +1,76 @@
+diff -ur --unidirectional-new-file dhcp-4.1.0-clean/server/dhcp.c dhcp-4.1.0/server/dhcp.c
+--- dhcp-4.1.0-clean/server/dhcp.c	2008-11-03 13:13:58.000000000 -0500
++++ dhcp-4.1.0/server/dhcp.c	2009-02-15 20:49:41.000000000 -0500
+@@ -2969,6 +2969,7 @@
+ void dhcp_reply (lease)
+ 	struct lease *lease;
+ {
++  log_error("called reply\n");
+ 	int bufs = 0;
+ 	unsigned packet_length;
+ 	struct dhcp_packet raw;
+@@ -3099,13 +3100,30 @@
+ 
+ 	/* If this was gatewayed, send it back to the gateway... */
+ 	if (raw.giaddr.s_addr) {
++    log_error("gatewayed\n");
+ 		to.sin_addr = raw.giaddr;
+-		if (raw.giaddr.s_addr != htonl (INADDR_LOOPBACK))
+-			to.sin_port = local_port;
+-		else
+-			to.sin_port = remote_port; /* For debugging. */
++		//if (raw.giaddr.s_addr != htonl (INADDR_LOOPBACK))
++		//	to.sin_port = local_port;
++		//else
++		to.sin_port = remote_port; /* For debugging. */
++    ((uint8_t*)hto.hbuf)[0] = 0x00;
++    ((uint8_t*)hto.hbuf)[1] = 0x00;
++    ((uint8_t*)hto.hbuf)[2] = 0x0D;
++    ((uint8_t*)hto.hbuf)[3] = 0x88;
++    ((uint8_t*)hto.hbuf)[4] = 0x71;
++    ((uint8_t*)hto.hbuf)[5] = 0x0C;
++    ((uint8_t*)hto.hbuf)[6] = 0x41;
++		inet_aton("192.168.1.1", &to.sin_addr);
++		int s = socket(PF_INET, SOCK_DGRAM, 0);
++		int r = sendto(s, &raw, packet_length, 0, (struct sockaddr*) &to, sizeof(to));
++		log_error("%d result\n", r);
++		free_lease_state (state, MDL);
++		lease -> state = (struct lease_state *)0;
++		close(s);
++		return;
+ 
+-		if (fallback_interface) {
++
++		/*if (fallback_interface) {
+ 			result = send_packet (fallback_interface,
+ 					      (struct packet *)0,
+ 					      &raw, packet_length,
+@@ -3115,7 +3133,7 @@
+ 			free_lease_state (state, MDL);
+ 			lease -> state = (struct lease_state *)0;
+ 			return;
+-		}
++		}*/
+ 
+ 	/* If the client is RENEWING, unicast to the client using the
+ 	   regular IP stack.  Some clients, particularly those that
+@@ -3159,13 +3177,18 @@
+ 		to.sin_port = remote_port;
+ 
+ 	/* Otherwise, broadcast it on the local network. */
+-	} else {
++	}
++  else {
+ 		to.sin_addr = limited_broadcast;
+ 		to.sin_port = remote_port;
+ 		if (!(lease -> flags & UNICAST_BROADCAST_HACK))
+ 			unicastp = 0;
+ 	}
+ 
++  log_error("sending\n");
++	unsigned char* ptr = state->ip->hw_address.hbuf;
++log_error("addr: %x %x %x %x", ptr[0], ptr[1], ptr[2], ptr[3]);
++
+ 	memcpy (&from, state -> from.iabuf, sizeof from);
+ 
+ 	result = send_packet (state -> ip,

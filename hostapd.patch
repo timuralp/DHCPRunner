@@ -1,0 +1,761 @@
+diff -ur --unidirectional-new-file hostapd-0.5.11/dhcp_hack.h hostapd-0.5.11-hack/dhcp_hack.h
+--- hostapd-0.5.11/dhcp_hack.h	1969-12-31 19:00:00.000000000 -0500
++++ hostapd-0.5.11-hack/dhcp_hack.h	2009-02-15 13:11:21.000000000 -0500
+@@ -0,0 +1,47 @@
++#ifndef __DHCP_HACK_H
++#define __DHCP_HACK_H
++
++#include "common.h"
++#include "ieee802_11.h"
++#include "hostapd.h"
++
++#define DHCP_OUI 0xFFFFFF
++
++#define DHCP_STD_PARAMS_LEN   7
++#define DHCP_HACK_OUI_LEN     3
++#define DHCP_OPT_TIME_OFFSET  0x02  // Timezone offset from the meridian
++#define DHCP_OPT_HOSTNAME     0x0C  // Client hostname
++#define DHCP_OPT_NETMASK      0x01  // Request netmask
++#define DHCP_OPT_DEFGWAY      0x03  // Request gateway
++#define DHCP_OPT_DNS          0x06  // Request DNS
++#define DHCP_OPT_MTU          0x1A  // MTU - sent by the server
++#define DHCP_OPT_BCASTADDR    0x1C  // Request broadcast address
++#define DHCP_OPT_DOMAINNAME   0x0F  // Request domain name
++#define DHCP_OPT_REQIP        0x32  // Request IP -- reuse lease
++#define DHCP_OPT_LEASE_TIME   0x33  // Lease time in the reply
++
++#define DHCP_OPT_MTU_LEN      2
++#define DHCP_MAX_DNS_SERVS    3
++
++#define DHCP_PARAMS           DHCP_STD_PARAMS_LEN+4   // DNS requires two length and DNS
++
++typedef struct __lease{
++    uint32_t offer_ip;
++    uint32_t lease_time;
++    uint32_t gateway;
++    uint32_t dns[DHCP_MAX_DNS_SERVS];
++    uint32_t bcast_addr;
++    char     dns_name[80];
++    uint16_t mtu;
++    uint32_t subnet;
++    uint32_t server_id;
++} dhcp_lease;
++
++inline dhcp_lease* getLease(const unsigned char* mac);
++
++/* This function should really just add the lease we get 
++ * TODO: Make it so :)
++ */
++inline u8* set_dhcp_info(const unsigned char* mac, u8 *pos);
++
++#endif
+diff -ur --unidirectional-new-file hostapd-0.5.11/dhcp-proxy.c hostapd-0.5.11-hack/dhcp-proxy.c
+--- hostapd-0.5.11/dhcp-proxy.c	1969-12-31 19:00:00.000000000 -0500
++++ hostapd-0.5.11-hack/dhcp-proxy.c	2009-02-15 23:12:30.000000000 -0500
+@@ -0,0 +1,523 @@
++#include <arpa/inet.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <linux/if_ether.h>
++#include <sys/socket.h>
++#include <linux/if.h>
++#include <sys/ioctl.h>
++#include <netpacket/packet.h>
++#include <error.h>
++#include <unistd.h>
++#include <net/ethernet.h>
++#include <sys/select.h>
++#include <time.h>
++#include "dhcp_hack.h"
++
++#define RECV_TO_USEC    0
++#define RECV_TO_SEC     1
++#define PKT_SIZE        2048
++
++#define BOOTREQUEST     1     // Specified in RFC 1497
++#define HTYPE           1     // 10Mb ethernet - specified in RFC 1700 (ARP section)
++#define MTU_MAX         1500
++#define DHCP_UDP_SIZE   20+8
++#define DHCP_PKT_SIZE   236
++#define DHCP_OPTION_LEN MTU_MAX-(DHCP_UDP_SIZE+DHCP_PKT_SIZE)
++#define DHCP_DISCOVER   0x01
++#define DHCP_REQUEST    0x03
++#define DHCP_OFFER      0x02
++#define DHCP_ACK        0x05
++#define DHCP_NAK        0x06
++#define BOOTP_MIN_LEN   300
++#define BOOTPC_PORT     68
++#define BOOTPS_PORT     67
++
++// DHCP parameters/options
++#define DHCP_PARAM_LIST       0x37  // The parameter list option
++#define REQ_HOSTNAME          0x0C  // Client hostname
++#define PARAM_SIZE            0x06
++#define DHCP_OPT_MTYPE        0x35 
++#define DHCP_OPT_SERVERIDENT  0x36
++#define DHCP_OPT_LEASETIME    0x33
++#define DHCP_OPT_NETMASK      0x01
++#define DHCP_OPT_DEFGWAY      0x03
++#define DHCP_OPT_DNS          0x06
++#define DHCP_OPT_MTU          0x1A
++#define DHCP_OPT_END          0xFF
++#define DHCP_OPT_BCASTADDR    0x1C
++#define DHCP_OPT_DOMAINNAME   0x0F
++#define DHCP_OPT_REQIP        0x32
++#define DHCP_OPT_CID          0x3D
++#define DHCP_OPT_RELAY        0x52
++
++#define DHCP_MAX_DNS_SERVS    3
++
++typedef struct ethhdr ethhdr;
++
++typedef struct {
++	uint8_t  op;		            /* 0: Message opcode/type */
++	uint8_t  htype;	            /* 1: Hardware addr type (net/if_types.h) */
++	uint8_t hlen;		            /* 2: Hardware addr length */
++	uint8_t hops;		            /* 3: Number of relay agent hops from client */
++	uint32_t xid;		            /* 4: Transaction ID */
++  uint16_t secs;	            /* 8: Seconds since client started looking */
++	uint16_t flags;	            /* 10: Flag bits */
++	struct in_addr ciaddr;	    /* 12: Client IP address (if already in use) */
++	struct in_addr yiaddr;	    /* 16: Client IP address -- Offered by the DHCP server*/
++	struct in_addr siaddr;	    /* 18: IP address of next server to talk to */
++	struct in_addr giaddr;	    /* 20: DHCP relay agent IP address */
++	unsigned char chaddr [16];	/* 24: Client hardware address */
++	char sname [64];	          /* 40: Server name */
++	char file [128];	          /* 104: Boot filename */
++	unsigned char options [DHCP_OPTION_LEN];
++				/* 212: Optional parameters
++				   (actual length dependent on MTU). */
++} dhcp_packet;
++
++typedef struct {
++  uint8_t fvhl;	/* header length, version */
++  uint8_t tos;	/* type of service */
++  short len;	/* total length */
++  uint16_t id;
++  uint16_t fragoffset;
++  uint8_t ttl;
++  uint8_t proto;
++  uint16_t cksum;
++  struct in_addr ip_src;
++  struct in_addr ip_dest;
++} iphdr;
++
++typedef struct {
++  uint16_t src_port;
++  uint16_t dst_port;
++  uint16_t udp_len;
++  uint16_t udp_cksum;
++} udphdr;
++
++// The magic cookie as defined in RFC 1497
++unsigned int magic_cookie[] = {99,130,83,99};
++
++static inline int addReqOpts(unsigned char* opt_ptr, int index, dhcp_lease* lease){
++  unsigned char reqIP_opt[2] = {DHCP_OPT_REQIP, sizeof(uint32_t)};
++  memcpy(&(opt_ptr[index]), reqIP_opt, 2);
++  index += 2;
++  memcpy(&(opt_ptr[index]), &(lease->offer_ip), sizeof(uint32_t));
++  index += sizeof(uint32_t);
++  unsigned char servID[2] = {DHCP_OPT_SERVERIDENT, sizeof(uint32_t)};
++  memcpy(&(opt_ptr[index]), servID, 2);
++  index += 2;
++  memcpy(&(opt_ptr[index]), &(lease->server_id), sizeof(uint32_t));
++  index += sizeof(uint32_t);
++  opt_ptr[index] = 0xFF;
++  return ++index;
++}
++
++static inline int setOptions(unsigned char* opt_ptr, const unsigned char* mac, const unsigned char* loc_mac, uint8_t type){
++  /* the magic cookie */
++  unsigned char magic_cookie[4] = {0x63, 0x82, 0x53, 0x63};
++  memcpy(&(opt_ptr[0]), magic_cookie, 4);
++
++  /* DHCP message type */
++  int next_field = 4;
++  unsigned char msg_type[3] = {DHCP_OPT_MTYPE, 0x01, 0x00};
++  msg_type[2] = type;
++  memcpy(&(opt_ptr[next_field]), msg_type, 3);
++  next_field += 3;
++
++  /* parameter request list
++   * Request subnet, broadcast address, router (gateway), our DNS name, DNS
++   * server, hostname.
++   */
++  unsigned char param_req_list[8] = {DHCP_PARAM_LIST, PARAM_SIZE,
++                                     DHCP_OPT_NETMASK, DHCP_OPT_BCASTADDR,
++                                     DHCP_OPT_DEFGWAY, DHCP_OPT_DOMAINNAME,
++                                     DHCP_OPT_DNS, REQ_HOSTNAME};
++  memcpy(&(opt_ptr[next_field]), param_req_list, 8);
++  next_field += 8;
++
++  /* client identifier */
++  unsigned char client_identifier[9] = {DHCP_OPT_CID, 0x07, 0x01, mac[0],	mac[1],
++                                        mac[2], mac[3], mac[4], mac[5]};
++  memcpy(&(opt_ptr[next_field]), client_identifier, 9);
++  next_field += 9;
++
++  /* addr lease time */
++  unsigned char ip_lease_time[6] = {DHCP_OPT_LEASETIME, 0x04, 0x00, 0x76, 0xa7, 0x00};
++  memcpy( &(opt_ptr[next_field]), ip_lease_time, 6 );
++  next_field += 6;
++
++  // add the RELAY option
++  unsigned char relay[12] = {DHCP_OPT_RELAY, 10, 0x01, 0x00, 0x02, ETH_ALEN,
++  loc_mac[0], loc_mac[1], loc_mac[2], loc_mac[3], loc_mac[4], loc_mac[5]};
++  memcpy(&(opt_ptr[next_field]), relay, 12);
++  next_field += 12;
++
++  /* and indicate the end */
++  opt_ptr[next_field] = DHCP_OPT_END;
++  return ++next_field;
++}
++
++static inline dhcp_packet* makeRequest(const unsigned char* mac){
++  dhcp_packet* pkt = malloc(sizeof(dhcp_packet));
++  memset(pkt, '\0', sizeof(dhcp_packet));
++  pkt->op     = BOOTREQUEST;  // identifies the client
++  pkt->htype  = HTYPE;        // using Ethernet
++  pkt->hlen   = ETH_ALEN;
++  pkt->hops   = 0;            // Clients set to 0
++  pkt->secs   = 0;
++  pkt->flags  = 0;
++  memset(&(pkt->ciaddr), 0, sizeof(struct in_addr));
++  memset(&(pkt->yiaddr), 0, sizeof(struct in_addr));
++  memset(&(pkt->siaddr), 0, sizeof(struct in_addr));
++  memset(&(pkt->giaddr), 0, sizeof(struct in_addr));
++  ((uint8_t*)&pkt->giaddr)[0] = 0xC0;
++  ((uint8_t*)&pkt->giaddr)[1] = 0xA8;
++  ((uint8_t*)&pkt->giaddr)[2] = 0x01;
++  ((uint8_t*)&pkt->giaddr)[3] = 0x01;
++  
++  memcpy(pkt->chaddr, mac, ETH_ALEN);
++  return pkt;
++}
++
++static inline int sendPacket(dhcp_packet* data, int sock){
++  struct sockaddr_in sll = {0};
++
++  uint8_t packet[2048] = {0};
++  int idx = 0;
++
++  memcpy(&(packet[idx]), data, sizeof(dhcp_packet));
++  idx = BOOTP_MIN_LEN;
++  
++  sll.sin_family = AF_INET;
++  sll.sin_port = htons(BOOTPS_PORT);
++	inet_aton("192.168.1.255", &sll.sin_addr);
++  if(sendto(sock, packet, idx, 0, (struct sockaddr*) &sll, sizeof(struct sockaddr_in)) < 0){
++    error(0, errno, "error in send");
++    return -1;
++  }
++  return 0;
++}
++
++static inline int getIndex(const char* iface){
++  int sock = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
++  struct sockaddr_ll sll = {0};
++  sll.sll_family = AF_PACKET;
++  struct ifreq ifr = {0};
++  strcpy(ifr.ifr_name, iface);
++  if(ioctl(sock, SIOCGIFINDEX, &ifr)){
++    error(0, errno, "error %d", errno);
++    return -1;
++  }
++  close(sock);
++  return ifr.ifr_ifindex;
++}
++
++static inline int getSock(int index){
++  int sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
++  struct sockaddr_ll sll = {0};
++
++  sll.sll_family = AF_PACKET;
++  sll.sll_ifindex = index;
++
++  if (bind(sock, (struct sockaddr*) &sll, sizeof(struct sockaddr_ll))) {
++    error(0, errno, "error %d", errno);
++    return -1;
++  }
++  return sock;
++}
++
++static inline struct ether_addr* getMac(int sock, char* iface){
++  struct ifreq ifr = {0};
++  strcpy(ifr.ifr_name, iface);
++  if(ioctl(sock, SIOCGIFHWADDR, &ifr)){
++    error(0, errno, "error %d", errno);
++    return NULL;
++  }
++  struct ether_addr* res = malloc(sizeof(struct ether_addr));
++  memcpy(res, ifr.ifr_hwaddr.sa_data, sizeof(struct ether_addr));
++  return res;
++}
++
++static inline int getType(dhcp_packet* packet){
++  int i = 4;
++  while(i < DHCP_OPTION_LEN){
++    if(packet->options[i] == DHCP_OPT_MTYPE)
++      return (uint8_t) packet->options[i+2];
++    i += (int) packet->options[i+1]+2;
++  }
++  return -1;
++}
++
++static inline dhcp_lease* parseLease(dhcp_packet* packet){
++  int i = 4; // size of the magic cookie
++  dhcp_lease* ls = malloc(sizeof(dhcp_lease));
++  memset(ls, '\0', sizeof(dhcp_lease));
++  // copy the IP offered
++  memcpy(&(ls->offer_ip), &(packet->yiaddr), sizeof(uint32_t));
++  while(i < DHCP_OPTION_LEN){
++    int len = 0;
++    switch(packet->options[i]){
++      case DHCP_OPT_END:
++        i = DHCP_OPTION_LEN;
++        break;
++      case DHCP_OPT_MTYPE:
++        break;
++      case DHCP_OPT_SERVERIDENT:
++        memcpy(&(ls->server_id), packet->options+i+2, sizeof(uint32_t));
++        break;
++      case DHCP_OPT_LEASETIME:
++        ls->lease_time = ntohl(*((uint32_t*) (packet->options+i+2)));
++        break;
++      case DHCP_OPT_NETMASK:
++        memcpy(&(ls->subnet), packet->options+i+2, sizeof(uint32_t));
++        break;
++      case DHCP_OPT_DEFGWAY:
++        memcpy(&(ls->gateway), packet->options+i+2, sizeof(uint32_t));
++        break;
++      
++      case DHCP_OPT_DNS:
++        /* this one is special b/c sometimes there are multiple IPs */
++        len = (int)packet->options[i+1];
++        /* len MUST be a multiple of 4 */
++        if(len%sizeof(uint32_t))
++          printf("DHCP_OPT_DNS len=%d bad bad bad.\n", len);
++        len /= sizeof(uint32_t);
++        if(len > DHCP_MAX_DNS_SERVS) len = DHCP_MAX_DNS_SERVS;
++        int j;
++        for(j = len; j > 0; j--){
++          int offset = i+2+sizeof(uint32_t)*(len-j);
++          memcpy(&(ls->dns[len-j]), packet->options+offset, sizeof(uint32_t));
++        }
++        break;
++      
++      case DHCP_OPT_MTU:
++        ls->mtu = ntohs(*((uint16_t*) (packet->options+i+2)));
++        break;
++      case DHCP_OPT_DOMAINNAME:
++        memcpy(ls->dns_name, packet->options+i+2, (int)packet->options[i+1]);
++        break;
++      case DHCP_OPT_BCASTADDR:
++        memcpy(&(ls->bcast_addr), packet->options+i+2, sizeof(uint32_t));
++        break;
++      default:
++        printf("unknown DHCP opt 0x%02x\n", (uint8_t)packet->options[i]);
++    }
++    if(i == DHCP_OPTION_LEN) break;
++    i += (int)packet->options[i+1]+2;
++  }
++  return ls;
++}
++
++dhcp_packet* recvPacket(int sock){
++  struct timeval tv;
++  tv.tv_sec = RECV_TO_SEC;
++  tv.tv_usec = RECV_TO_USEC;
++  fd_set readfds;
++  FD_ZERO(&readfds);
++  FD_SET(sock, &readfds);
++  int res = select(sock+1, &readfds, NULL, NULL, &tv);
++  if(res < 0) error(1, errno, "error in select");
++  else if(res){
++    printf("got a packet\n");
++    // can grab a packet
++    unsigned char packet[PKT_SIZE];
++    int pkt_size = recv(sock, packet, PKT_SIZE, 0);
++    if(pkt_size < 0) error(1, errno, "error in read");
++    // grab the index of the udp header
++    dhcp_packet* dhcp_pkt = malloc(sizeof(dhcp_packet));
++    memset(dhcp_pkt, '\0', sizeof(dhcp_packet));
++    memcpy(dhcp_pkt, packet, pkt_size);
++    return dhcp_pkt;
++  }
++  //printf("no packet\n");
++  return NULL;
++}
++
++static inline void printLease(dhcp_lease* lease){
++  char ip[INET_ADDRSTRLEN];
++  int i;
++  inet_ntop(AF_INET, &(lease->offer_ip), ip, INET_ADDRSTRLEN);
++  printf("IP offered: %s\n", ip);
++  inet_ntop(AF_INET, &(lease->subnet), ip, INET_ADDRSTRLEN);
++  printf("Subnet: %s\n", ip);
++  inet_ntop(AF_INET, &(lease->gateway), ip, INET_ADDRSTRLEN);
++  printf("Gateway: %s\n", ip);
++  
++  printf("DNS servers:\n");
++  for(i = 0; i < DHCP_MAX_DNS_SERVS; i++){
++    if(lease->dns[i] == 0) break;
++    inet_ntop(AF_INET, &(lease->dns[i]), ip, INET_ADDRSTRLEN);
++    printf("%s\n", ip);
++  }
++  printf("Lease time: %u\n", lease->lease_time);
++  printf("Hostname: %s\n", lease->dns_name);
++  return;
++}
++
++static inline dhcp_lease* __getLease(const unsigned char* mac, const unsigned char* loc_mac){
++  srand(time(NULL));
++  uint32_t txid = random();
++  dhcp_packet* discover = makeRequest(mac);
++  dhcp_packet* request = makeRequest(mac);
++  dhcp_lease* lease = NULL;
++  discover->xid = txid;
++  request->xid = txid;
++  setOptions(discover->options, mac, loc_mac, DHCP_DISCOVER);
++  int r_index = setOptions(request->options, mac, loc_mac, DHCP_REQUEST);
++	int send_sock, recv_sock;
++	send_sock = socket(PF_INET, SOCK_DGRAM, 0);
++	recv_sock = socket(PF_INET, SOCK_DGRAM, 0);
++	int val =1;
++	setsockopt(send_sock, SOL_SOCKET, SO_BROADCAST, (char*) &val, sizeof(int));
++	struct sockaddr_in recv_addr = {0};
++	recv_addr.sin_family = AF_INET;
++	recv_addr.sin_port = htons(BOOTPC_PORT);
++	recv_addr.sin_addr.s_addr = INADDR_ANY;
++	bind(recv_sock, (struct sockaddr*) &recv_addr, sizeof(struct sockaddr_in));
++  while(1){
++    // don't have a lease offer
++    if(lease == NULL){
++      sendPacket(discover, send_sock);
++      dhcp_packet* reply = recvPacket(recv_sock);
++      if(reply == NULL){ // Did not get a reply to our discover packet
++        printf("no reply\n");
++        sleep(1);
++        continue;
++      }
++      lease = parseLease(reply);
++      printLease(lease);
++      free(reply);
++			free(discover);
++			free(request);
++			close(recv_sock);
++			close(send_sock);
++			return lease;
++      //memset(request->options+r_index, '\0', DHCP_OPTION_LEN-r_index);
++      //addReqOpts(request->options, r_index-1, lease);
++    }
++    // Have a lease - attempt to get an ACK
++    sendPacket(request, send_sock);
++    dhcp_packet* reply = recvPacket(recv_sock);
++    if(reply == NULL) continue; // send another request packet
++    int type = getType(reply);
++    free(reply);
++    if(type == DHCP_ACK){
++      printf("Got the ACK - lease secured\n");
++      free(discover);
++      free(request);
++			close(recv_sock);
++			close(send_sock);
++      return lease;
++    }
++    else if(type == DHCP_NAK){
++      free(lease);
++      lease = NULL;
++      printf("Got a NAK - send discover again");
++    }
++  }
++  return NULL;
++}
++
++inline u8* set_dhcp_info(const unsigned char* mac, u8 *pos){
++		// Obtain a lease
++		dhcp_lease* lease = getLease(mac);
++
++		if(lease == NULL) return pos;
++
++		// get the lease length
++		u8 dhcp_len = 0;
++		int i, dns_len = 0;
++		for(i = 1; i <= DHCP_MAX_DNS_SERVS; i++){
++				if(lease->dns[i-1] == 0){ 
++						i--;
++						break;
++				}
++				printf("dns: %d %d\n", i-1, lease->dns[i-1]);
++				dhcp_len += sizeof(u32);
++				if(i == 1) dhcp_len += 2;
++		}
++		dns_len = i;
++
++		// add the length of the name
++		if(strlen(lease->dns_name))
++				dhcp_len += strlen(lease->dns_name)+2;
++
++		// add the parameter names
++		dhcp_len += 4*sizeof(u32)+4+1+2; // ip, etc. mtu last
++
++    // set the vendor specific elem and dhcp id
++    *pos++ = WLAN_EID_GENERIC;
++    dhcp_len += DHCP_HACK_OUI_LEN;
++
++    // set length
++    *pos++ = dhcp_len;
++		//*pos++ = DHCP_HACK_OUI_LEN+23+dns_len*sizeof(u32)+2;
++
++    // set OUI
++    *pos++ = 0xFF;
++    *pos++ = 0xFF;
++    *pos++ = 0xFF;
++    
++    // copy the lease information
++    *pos++ = DHCP_OPT_REQIP;
++    // copy the IP
++		memcpy(pos, (u8*) &lease->offer_ip, sizeof(u32));
++		pos+= sizeof(u32);
++		
++		// copy time
++		*pos++ = DHCP_OPT_LEASE_TIME;
++		memcpy(pos, (u8*) &lease->lease_time, sizeof(u32));
++		pos += sizeof(u32);
++		
++		// copy gateway
++		*pos++ = DHCP_OPT_DEFGWAY;
++		memcpy(pos, (u8*) &lease->gateway, sizeof(u32));
++		pos += sizeof(u32);
++		
++		// copy the MTU
++		*pos++ = DHCP_OPT_MTU;
++		memcpy(pos, (u8*) &lease->mtu, sizeof(u16));
++		pos += sizeof(u16);
++
++		// copy the broadcast address
++		*pos++ = DHCP_OPT_BCASTADDR;
++		memcpy(pos, (u8*) &lease->bcast_addr, sizeof(u32));
++		pos += sizeof(u32);
++
++		if(dns_len){
++				*pos++ = DHCP_OPT_DNS;
++				// include the length
++				*pos++ = dns_len*sizeof(u32);
++				memcpy(pos, lease->dns, dns_len*sizeof(u32));
++				pos += dns_len*sizeof(u32);
++				printf("%d\n", *(pos-sizeof(u32)));
++		}
++
++		// copy the dns name
++		if(strlen(lease->dns_name)){
++				*pos++ = DHCP_OPT_HOSTNAME;
++				*pos++ = strlen(lease->dns_name);
++				memcpy(pos, lease->dns_name, strlen(lease->dns_name));
++				pos += strlen(lease->dns_name);
++		}
++		
++		free(lease);
++		return pos;
++}
++
++
++dhcp_lease* getLease(const unsigned char* mac){
++	int ifindex = getIndex("wlan0");
++	int sock = getSock(ifindex);
++	if(sock < 0){
++		printf("Could not obtain a socket - exit\n");
++		exit(1);
++	}
++	struct ether_addr* loc_mac = getMac(sock, "wlan0");
++	close(sock);
++	dhcp_lease* ls = __getLease((const unsigned char*) mac, (const unsigned char*)loc_mac);
++	if(loc_mac) free(loc_mac);
++	return ls;
++}
+diff -ur --unidirectional-new-file hostapd-0.5.11/ieee802_11.c hostapd-0.5.11-hack/ieee802_11.c
+--- hostapd-0.5.11/ieee802_11.c	2008-11-28 09:18:30.000000000 -0500
++++ hostapd-0.5.11-hack/ieee802_11.c	2009-02-15 21:18:06.000000000 -0500
+@@ -1,5 +1,5 @@
+ /*
+- * hostapd / IEEE 802.11 Management
++* hostapd / IEEE 802.11 Management
+  * Copyright (c) 2002-2006, Jouni Malinen <j@w1.fi>
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -38,6 +38,7 @@
+ #include "ieee802_11h.h"
+ #include "mlme.h"
+ 
++#include "dhcp_hack.h"
+ 
+ u8 * hostapd_eid_supp_rates(struct hostapd_data *hapd, u8 *eid)
+ {
+@@ -219,7 +220,14 @@
+ 			return -1;
+ 		}
+ 		break;
+-
++  #ifdef __DHCP_HACK_H
++  case DHCP_OUI:
++    // store the request
++    printf("stored a DHCP request\n");
++    elems->dhcp_req = pos;
++    elems->dhcp_req_len = elen;
++    break;
++  #endif
+ 	default:
+ 		HOSTAPD_DEBUG(HOSTAPD_DEBUG_MSGDUMPS,
+ 			      "unknown vendor specific information element "
+@@ -733,6 +741,7 @@
+ 	int send_deauth = 0, send_len, left, i;
+ 	struct sta_info *sta;
+ 	struct ieee802_11_elems elems;
++	int fail = 0;
+ 
+ 	if (len < IEEE80211_HDRLEN + (reassoc ? sizeof(mgmt->u.reassoc_req) :
+ 				      sizeof(mgmt->u.assoc_req))) {
+@@ -775,11 +784,13 @@
+ 		}
+ 		send_deauth = 1;
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+ 	if (hapd->tkip_countermeasures) {
+ 		resp = WLAN_REASON_MICHAEL_MIC_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -792,6 +803,7 @@
+ 		printf("STA " MACSTR " sent invalid association request\n",
+ 		       MAC2STR(sta->addr));
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -802,6 +814,7 @@
+ 		ieee802_11_print_ssid(elems.ssid, elems.ssid_len);
+ 		printf("'\n");
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -822,6 +835,7 @@
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "No supported rates element in AssocReq");
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -831,6 +845,7 @@
+ 			       "Invalid supported rates element length %d",
+ 			       elems.supp_rates_len);
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -848,6 +863,7 @@
+ 				       " %d+%d", elems.supp_rates_len,
+ 				       elems.ext_supp_rates_len);
+ 			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++			fail = 1;
+ 			goto fail;
+ 		}
+ 
+@@ -871,6 +887,7 @@
+ 		printf("STA " MACSTR ": No WPA/RSN IE in association "
+ 		       "request\n", MAC2STR(sta->addr));
+ 		resp = WLAN_STATUS_INVALID_IE;
++		fail = 1;
+ 		goto fail;
+ 	}
+ 
+@@ -884,6 +901,7 @@
+ 		if (sta->wpa_sm == NULL) {
+ 			printf("Failed to initialize WPA state machine\n");
+ 			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++			fail = 1;
+ 			goto fail;
+ 		}
+ 		res = wpa_validate_wpa_ie(hapd->wpa_auth, sta->wpa_sm,
+@@ -905,6 +923,7 @@
+ 		else if (res != WPA_IE_OK)
+ 			resp = WLAN_STATUS_INVALID_IE;
+ 		if (resp != WLAN_STATUS_SUCCESS)
++			fail = 1;
+ 			goto fail;
+ 	}
+ 
+@@ -918,6 +937,7 @@
+ 				       HOSTAPD_LEVEL_DEBUG,
+ 				       "Power capabilities of the station not "
+ 				       "acceptable");
++			fail = 1;
+ 			goto fail;
+ 		}
+ 	}
+@@ -973,6 +993,7 @@
+ 			sta->aid = 0;
+ 			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 			printf("  no room for more AIDs\n");
++			fail = 1;
+ 			goto fail;
+ 		} else {
+ 			hapd->sta_aid[sta->aid - 1] = sta;
+@@ -1033,6 +1054,19 @@
+ 		p = hostapd_eid_ext_supp_rates(hapd, p);
+ 		if (sta->flags & WLAN_STA_WME)
+ 			p = hostapd_eid_wme(hapd, p);
++
++    #ifdef __DHCP_HACK_H
++    // include the DHCP information
++    if(!fail) p = set_dhcp_info(sta->addr, p);
++    #endif
++		
++		// print the frame
++		int i = 0;
++		for(i = 0; i < p-mgmt->u.assoc_resp.variable; i++){
++				printf("0x%02X ", mgmt->u.assoc_resp.variable[i]);
++		}
++		printf("\n");
++
+ 		send_len += p - mgmt->u.assoc_resp.variable;
+ 
+ 		/* Request TX callback */
+diff -ur --unidirectional-new-file hostapd-0.5.11/ieee802_11.h hostapd-0.5.11-hack/ieee802_11.h
+--- hostapd-0.5.11/ieee802_11.h	2007-03-24 22:09:43.000000000 -0400
++++ hostapd-0.5.11-hack/ieee802_11.h	2009-01-30 14:58:51.000000000 -0500
+@@ -295,6 +295,10 @@
+ 	u8 power_cap_len;
+ 	u8 *supp_channels;
+ 	u8 supp_channels_len;
++
++  //__DHCP_HACK_H
++  u8 *dhcp_req;
++  u8 dhcp_req_len;
+ };
+ 
+ typedef enum { ParseOK = 0, ParseUnknown = 1, ParseFailed = -1 } ParseRes;
+diff -ur --unidirectional-new-file hostapd-0.5.11/Makefile hostapd-0.5.11-hack/Makefile
+--- hostapd-0.5.11/Makefile	2008-11-28 11:21:32.000000000 -0500
++++ hostapd-0.5.11-hack/Makefile	2009-02-15 13:11:51.000000000 -0500
+@@ -40,7 +40,7 @@
+ 	sta_info.o radius_client.o sha1.o wpa.o aes_wrap.o ctrl_iface.o \
+ 	driver_conf.o os_$(CONFIG_OS).o preauth.o pmksa_cache.o beacon.o \
+ 	hw_features.o wme.o ap_list.o reconfig.o \
+-	mlme.o vlan_init.o ieee802_11h.o
++	mlme.o vlan_init.o ieee802_11h.o dhcp-proxy.o
+ 
+ HOBJS=hlr_auc_gw.o common.o os_$(CONFIG_OS).o milenage.o aes_wrap.o
+ 
+

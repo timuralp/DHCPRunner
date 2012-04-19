@@ -1,0 +1,184 @@
+diff -ur --unidirectional-new-file linux-source-2.6.26/net/mac80211/dhcp_hack.h linux-source-2.6.26-80211hack/net/mac80211/dhcp_hack.h
+--- linux-source-2.6.26/net/mac80211/dhcp_hack.h	1969-12-31 19:00:00.000000000 -0500
++++ linux-source-2.6.26-80211hack/net/mac80211/dhcp_hack.h	2009-01-11 14:43:49.000000000 -0500
+@@ -0,0 +1,16 @@
++#ifndef DHCP_HACK
++#define DHCP_HACK
++
++#define DHCP_STD_PARAMS_LEN   7
++#define DHCP_HACK_OUI_LEN     3
++#define DHCP_OPT_TIME_OFFSET  0x02  // Timezone offset from the meridian
++#define DHCP_OPT_HOSTNAME     0x0C  // Client hostname
++#define DHCP_OPT_NETMASK      0x01  // Request netmask
++#define DHCP_OPT_DEFGWAY      0x03  // Request gateway
++#define DHCP_OPT_DNS          0x06  // Request DNS
++#define DHCP_OPT_MTU          0x1A  // MTU - sent by the server
++#define DHCP_OPT_BCASTADDR    0x1C  // Request broadcast address
++#define DHCP_OPT_DOMAINNAME   0x0F  // Request domain name
++#define DHCP_OPT_REQIP        0x32  // Request IP -- reuse lease
++
++#endif
+diff -ur --unidirectional-new-file linux-source-2.6.26/net/mac80211/ieee80211_i.h linux-source-2.6.26-80211hack/net/mac80211/ieee80211_i.h
+--- linux-source-2.6.26/net/mac80211/ieee80211_i.h	2008-07-13 17:51:29.000000000 -0400
++++ linux-source-2.6.26-80211hack/net/mac80211/ieee80211_i.h	2009-01-11 14:48:12.000000000 -0500
+@@ -26,6 +26,9 @@
+ #include "key.h"
+ #include "sta_info.h"
+ 
++// DHCP_HACK stuff
++#include "dhcp_hack.h"
++
+ /* ieee80211.o internal definitions, etc. These are not included into
+  * low-level drivers. */
+ 
+@@ -810,6 +813,11 @@
+ 	u8 *prep;
+ 	u8 *perr;
+ 
++  #ifdef DHCP_HACK
++  u8 *dhcp;
++  u8 dhcp_len;
++  #endif
++
+ 	/* length of them, respectively */
+ 	u8 ssid_len;
+ 	u8 supp_rates_len;
+diff -ur --unidirectional-new-file linux-source-2.6.26/net/mac80211/mlme.c linux-source-2.6.26-80211hack/net/mac80211/mlme.c
+--- linux-source-2.6.26/net/mac80211/mlme.c	2008-07-13 17:51:29.000000000 -0400
++++ linux-source-2.6.26-80211hack/net/mac80211/mlme.c	2009-02-24 13:45:29.000000000 -0500
+@@ -34,6 +34,10 @@
+ #include "led.h"
+ #include "mesh.h"
+ 
++// DHCP at association header
++#include "dhcp_hack.h"
++#include <linux/time.h>
++
+ #define IEEE80211_AUTH_TIMEOUT (HZ / 5)
+ #define IEEE80211_AUTH_MAX_TRIES 3
+ #define IEEE80211_ASSOC_TIMEOUT (HZ / 5)
+@@ -88,15 +92,14 @@
+ static int ieee80211_sta_config_auth(struct net_device *dev,
+ 				     struct ieee80211_if_sta *ifsta);
+ 
+-
+ void ieee802_11_parse_elems(u8 *start, size_t len,
+ 			    struct ieee802_11_elems *elems)
+ {
+ 	size_t left = len;
+ 	u8 *pos = start;
+ 
+-	memset(elems, 0, sizeof(*elems));
+-
++  memset(elems, 0, sizeof(*elems));
++ 
+ 	while (left >= 2) {
+ 		u8 id, elen;
+ 
+@@ -158,6 +161,15 @@
+ 					}
+ 				}
+ 			}
++      #ifdef DHCP_HACK
++      // WLAN_EID_WPA = WLAN_EID_GENERIC -- can be used for other things
++      // Our custom DHCP uses 0xFF 0xFF 0xFF identifier
++      if(elen >= 4 && pos[0] == 0xFF && pos[1] == 0xFF && pos[2] == 0xFF){
++        printk("Found the DHCP info %02u\n", elen);
++        elems->dhcp = pos;
++        elems->dhcp_len = elen;
++      }
++      #endif
+ 			break;
+ 		case WLAN_EID_RSN:
+ 			elems->rsn = pos;
+@@ -644,12 +656,14 @@
+ 	ieee80211_sta_tx(dev, skb, encrypt);
+ }
+ 
+-
+ static void ieee80211_authenticate(struct net_device *dev,
+ 				   struct ieee80211_if_sta *ifsta)
+ {
+ 	DECLARE_MAC_BUF(mac);
+-
++    if(ifsta->auth_tries == 0){
++        struct timespec tm = current_kernel_time();
++        printk(KERN_DEBUG "%s Began auth %ld:%ld\n", dev->name, tm.tv_sec, tm.tv_nsec);
++    }
+ 	ifsta->auth_tries++;
+ 	if (ifsta->auth_tries > IEEE80211_AUTH_MAX_TRIES) {
+ 		printk(KERN_DEBUG "%s: authentication with AP %s"
+@@ -702,6 +716,15 @@
+ 	int wmm = 0;
+ 	struct ieee80211_supported_band *sband;
+ 	u64 rates = 0;
++  #ifdef DHCP_HACK
++  unsigned char dhcp_hack_std_params[] = { DHCP_OPT_TIME_OFFSET, 
++                                           DHCP_OPT_NETMASK,
++                                           DHCP_OPT_DEFGWAY,
++                                           DHCP_OPT_DNS, 
++                                           DHCP_OPT_BCASTADDR,
++                                           DHCP_OPT_DOMAINNAME
++                                         };
++  #endif
+ 
+ 	skb = dev_alloc_skb(local->hw.extra_tx_headroom +
+ 			    sizeof(*mgmt) + 200 + ifsta->extra_ie_len +
+@@ -839,13 +862,25 @@
+ 		memcpy(pos, sband->ht_info.supp_mcs_set, 16);
+ 	}
+ 
+-	kfree(ifsta->assocreq_ies);
+-	ifsta->assocreq_ies_len = (skb->data + skb->len) - ies;
+-	ifsta->assocreq_ies = kmalloc(ifsta->assocreq_ies_len, GFP_KERNEL);
+-	if (ifsta->assocreq_ies)
+-		memcpy(ifsta->assocreq_ies, ies, ifsta->assocreq_ies_len);
++    #ifdef DHCP_HACK
++    pos = skb_put(skb, DHCP_STD_PARAMS_LEN+DHCP_HACK_OUI_LEN+2);
++    *pos++ = WLAN_EID_VENDOR_SPECIFIC;
++    *pos++ = DHCP_STD_PARAMS_LEN+DHCP_HACK_OUI_LEN;
++    *pos++ = 0xFF; // Fake OUI
++    *pos++ = 0xFF;
++    *pos++ = 0xFF;
++    // copy the parameters
++    memcpy(pos, dhcp_hack_std_params, DHCP_STD_PARAMS_LEN);
++    pos += DHCP_STD_PARAMS_LEN;
++    #endif
++
++    kfree(ifsta->assocreq_ies);
++    ifsta->assocreq_ies_len = (skb->data + skb->len) - ies;
++    ifsta->assocreq_ies = kmalloc(ifsta->assocreq_ies_len, GFP_KERNEL);
++    if (ifsta->assocreq_ies)
++        memcpy(ifsta->assocreq_ies, ies, ifsta->assocreq_ies_len);
+ 
+-	ieee80211_sta_tx(dev, skb, 0);
++    ieee80211_sta_tx(dev, skb, 0);
+ }
+ 
+ 
+@@ -980,7 +1015,10 @@
+ 	 * missed beacons. Scan other channels every now and then and search
+ 	 * for better APs. */
+ 	/* TODO: remove expired BSSes */
+-
++    if(ifsta->state != IEEE80211_ASSOCIATED){
++        struct timespec tm = current_kernel_time();
++        printk(KERN_DEBUG "%s Associated: %ld:%ld\n", dev->name, tm.tv_sec, tm.tv_nsec);
++    }
+ 	ifsta->state = IEEE80211_ASSOCIATED;
+ 
+ 	rcu_read_lock();
+@@ -1987,6 +2025,13 @@
+ 		return;
+ 	}
+ 
++    #ifdef DHCP_HACK
++    printk("DHCP info: len: %d\n", elems.dhcp_len);
++    for(i = 0; i < elems.dhcp_len; i++)
++        printk("%x ", elems.dhcp[i]);
++    printk("\n");
++    #endif
++
+ 	printk(KERN_DEBUG "%s: associated\n", dev->name);
+ 	ifsta->aid = aid;
+ 	ifsta->ap_capab = capab_info;
